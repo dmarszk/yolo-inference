@@ -10,8 +10,29 @@ option(WITH_CUDA_PREPROCESS "build _CUDA_PREPROCESS" ON)
 option(WITH_CUDA_POSTPROCESS "build _CUDA_POSTPROCESS" ON)
 
 if(WITH_CUDA)
-    set(CMAKE_CUDA_COMPILER "/usr/local/cuda-12.5/bin/nvcc")
-    project(yolo LANGUAGES C CXX CUDA)
+    # Try to find nvcc in PATH, common CUDA locations or via CUDA_HOME/CUDA_PATH
+    find_program(NVCC_EXECUTABLE nvcc
+        HINTS
+            ENV CUDA_HOME
+            ENV CUDA_PATH
+            /usr/local/cuda
+            /usr/local
+            /opt/cuda
+        PATHS
+            /usr/bin
+            /usr/local/bin
+        PATH_SUFFIXES bin
+    )
+
+    if(NVCC_EXECUTABLE)
+        message(STATUS "Found nvcc: ${NVCC_EXECUTABLE}")
+        set(CMAKE_CUDA_COMPILER "${NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
+        project(yolo LANGUAGES C CXX CUDA)
+    else()
+        message(WARNING "WITH_CUDA is ON but nvcc was not found. Configuring project without CUDA language.")
+        set(WITH_CUDA OFF CACHE BOOL "Disable CUDA support because nvcc not found" FORCE)
+        project(yolo LANGUAGES C CXX)
+    endif()
 else()
     project(yolo LANGUAGES C CXX)
 endif()
@@ -114,45 +135,77 @@ if(CMAKE_SYSTEM_NAME MATCHES "Windows")
 endif()
 
 if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    add_executable(yolo ${SRCS})
+
     if(WITH_CUDA)
-        find_package(CUDA REQUIRED)
-        include_directories(${CUDA_INCLUDE_DIRS})
-        cuda_add_executable(yolo ${SRCS})
-        target_link_libraries(yolo ${CUDA_LIBRARIES})
-    else()
-        add_executable(yolo ${SRCS})
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(yolo PRIVATE CUDA::cudart)
     endif()
 
+    # OpenCV (preferred modern target or fall back to variables)
     find_package(OpenCV REQUIRED)
-    include_directories(${OpenCV_INCLUDE_DIRS} ${OpenCV2_INCLUDE_DIRS})
-    target_link_libraries(yolo ${OpenCV_LIBRARIES})  
+    target_include_directories(yolo PRIVATE ${OpenCV_INCLUDE_DIRS})
+    target_link_libraries(yolo PRIVATE ${OpenCV_LIBS})
 
     if(WITH_LIBTORCH)
-        set(Torch_DIR /home/libtorch/share/cmake/Torch)
         find_package(Torch REQUIRED)
-        include_directories(${TORCH_INCLUDE_DIRS})
-        target_link_libraries(yolo ${TORCH_LIBRARIES})
+        # Torch provides imported targets; prefer using them
+        if(TARGET Torch::Torch)
+            target_link_libraries(yolo PRIVATE Torch::Torch)
+        else()
+            target_include_directories(yolo PRIVATE ${TORCH_INCLUDE_DIRS})
+            target_link_libraries(yolo PRIVATE ${TORCH_LIBRARIES})
+        endif()
     endif()
 
     if(WITH_ONNXRUNTIME)
-        set(ONNXRUNTIME_INCLUDE_DIRS /home/onnxruntime-linux-x64-gpu-1.20.0/include)
-        set(ONNXRUNTIME_LIBRARY_DIRS /home/onnxruntime-linux-x64-gpu-1.20.0/lib)
-        include_directories(${ONNXRUNTIME_INCLUDE_DIRS})
-        target_link_libraries(yolo ${ONNXRUNTIME_LIBRARY_DIRS}/libonnxruntime.so)
+        find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+            HINTS /usr/local/include /usr/include /opt/onnxruntime/include PATH_SUFFIXES onnxruntime)
+        find_library(ONNXRUNTIME_LIBRARY NAMES onnxruntime
+            HINTS /usr/local/lib /usr/lib /opt/onnxruntime/lib /usr/lib/x86_64-linux-gnu PATH_SUFFIXES onnxruntime)
+        if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIBRARY)
+            target_include_directories(yolo PRIVATE ${ONNXRUNTIME_INCLUDE_DIR})
+            target_link_libraries(yolo PRIVATE ${ONNXRUNTIME_LIBRARY})
+        else()
+            message(FATAL_ERROR "ONNX Runtime requested but not found. Set ONNXRUNTIME_* variables or install ONNX Runtime.")
+        endif()
     endif()
 
     if(WITH_OPENVINO)
-        set(OPENVINO_INCLUDE_DIRS /home/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/include)
-        set(OPENVINO_LIBRARY_DIRS /home/l_openvino_toolkit_ubuntu20_2024.4.0.16579.c3152d32c9c_x86_64/runtime/lib/intel64)
-        include_directories(${OPENVINO_INCLUDE_DIRS})
-        target_link_libraries(yolo ${OPENVINO_LIBRARY_DIRS}/libopenvino.so ${OPENVINO_LIBRARY_DIRS}/libopenvino_intel_cpu_plugin.so ${OPENVINO_LIBRARY_DIRS}/libopenvino_intel_gpu_plugin.so)
+        find_path(OPENVINO_INCLUDE_DIR openvino/runtime/core.hpp
+            HINTS /usr/local/include /opt/intel/openvino/include /opt/openvino/include)
+        find_library(OPENVINO_LIB NAMES openvino
+            HINTS /usr/local/lib /opt/intel/openvino/lib /opt/openvino/lib /usr/lib)
+        # optional plugins
+        find_library(OPENVINO_CPU_PLUGIN NAMES openvino_intel_cpu_plugin
+            HINTS /usr/local/lib /opt/intel/openvino/lib /opt/openvino/lib /usr/lib)
+        find_library(OPENVINO_GPU_PLUGIN NAMES openvino_intel_gpu_plugin
+            HINTS /usr/local/lib /opt/intel/openvino/lib /opt/openvino/lib /usr/lib)
+
+        if(OPENVINO_INCLUDE_DIR AND OPENVINO_LIB)
+            target_include_directories(yolo PRIVATE ${OPENVINO_INCLUDE_DIR})
+            target_link_libraries(yolo PRIVATE ${OPENVINO_LIB})
+            if(OPENVINO_CPU_PLUGIN)
+                target_link_libraries(yolo PRIVATE ${OPENVINO_CPU_PLUGIN})
+            endif()
+            if(OPENVINO_GPU_PLUGIN)
+                target_link_libraries(yolo PRIVATE ${OPENVINO_GPU_PLUGIN})
+            endif()
+        else()
+            message(FATAL_ERROR "OpenVINO requested but not found. Set OPENVINO_* variables or install OpenVINO.")
+        endif()
     endif()
 
     if(WITH_TENSORRT)
-        set(TENSORRT_INCLUDE_DIRS /home/TensorRT-10.6.0.26/include)
-        set(TENSORRT_LIBRARY_DIRS /home/TensorRT-10.6.0.26/lib)
-        include_directories(${TENSORRT_INCLUDE_DIRS})
-        link_directories(${TENSORRT_LIBRARY_DIRS})
-        target_link_libraries(yolo ${TENSORRT_LIBRARY_DIRS}/libnvinfer.so)
-    endif() 
+        find_path(TENSORRT_INCLUDE_DIR NvInfer.h
+            HINTS /usr/local/include /usr/include /usr/include/x86_64-linux-gnu)
+        find_library(TENSORRT_LIBRARY NAMES nvinfer
+            HINTS /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+        if(TENSORRT_INCLUDE_DIR AND TENSORRT_LIBRARY)
+            target_include_directories(yolo PRIVATE ${TENSORRT_INCLUDE_DIR})
+            target_link_libraries(yolo PRIVATE ${TENSORRT_LIBRARY})
+        else()
+            message(FATAL_ERROR "TensorRT requested but not found. Set TENSORRT_* variables or install TensorRT.")
+        endif()
+    endif()
 endif()
